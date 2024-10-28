@@ -1,75 +1,128 @@
-// server/main.go
 package main
 
 import (
-	"crypto/tls"
-	"flag"
+	"GoToGo/server/cli"
+	"GoToGo/server/config"
+	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
-	"os"
-	"path/filepath"
-	"time"
-
-	"GoToGo/server/api"
-	"GoToGo/server/cert"
-	"GoToGo/server/session"
+	"sync"
 )
 
-var (
-	certDir = flag.String("cert-dir", "certs", "Directory for certificates")
-	port    = flag.String("port", "8443", "Server port")
-	logFile = flag.String("log", "logs/server.log", "Log file path")
-)
+type Agent struct {
+	ID       string `json:"id"`
+	Hostname string `json:"hostname"`
+	Status   string `json:"status"`
+	LastSeen string `json:"lastSeen"`
+}
+
+type Server struct {
+	agents map[string]Agent
+	mutex  sync.RWMutex
+}
+
+type Command struct {
+	Type    string `json:"type"`
+	Payload string `json:"payload"`
+}
+
+type SystemInfo struct {
+	CPUUsage    float64 `json:"cpuUsage"`
+	MemoryUsage float64 `json:"memoryUsage"`
+	DiskUsage   float64 `json:"diskUsage"`
+}
+
+func NewServer() *Server {
+	return &Server{
+		agents: make(map[string]Agent),
+	}
+}
+
+func (s *Server) handleAgentRegistration(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var agent Agent
+	if err := json.NewDecoder(r.Body).Decode(&agent); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	s.mutex.Lock()
+	s.agents[agent.ID] = agent
+	s.mutex.Unlock()
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) handleSystemInfo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	agentID := r.Header.Get("X-Agent-ID")
+	if agentID == "" {
+		http.Error(w, "Agent ID not provided", http.StatusBadRequest)
+		return
+	}
+
+	var sysInfo SystemInfo
+	if err := json.NewDecoder(r.Body).Decode(&sysInfo); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("Received system info from agent %s: CPU: %.2f%%, Memory: %.2f%%, Disk: %.2f%%",
+		agentID, sysInfo.CPUUsage, sysInfo.MemoryUsage, sysInfo.DiskUsage)
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	s.mutex.RLock()
+	agents := make([]Agent, 0, len(s.agents))
+	for _, agent := range s.agents {
+		agents = append(agents, agent)
+	}
+	s.mutex.RUnlock()
+
+	json.NewEncoder(w).Encode(agents)
+}
 
 func main() {
-	flag.Parse()
-
-	// Setup logging
-	os.MkdirAll("logs", 0755)
-	f, err := os.OpenFile(*logFile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	// Load configuration
+	config, err := config.LoadConfig()
 	if err != nil {
-		log.Fatalf("Error opening log file: %v", err)
-	}
-	defer f.Close()
-	log.SetOutput(f)
-
-	// Initialize certificate manager
-	certManager, err := cert.NewCertManager(*certDir)
-	if err != nil {
-		log.Fatalf("Failed to initialize certificate manager: %v", err)
+		log.Fatalf("Error loading configuration: %v", err)
 	}
 
-	// Initialize session manager
-	sessionManager := session.NewSessionManager(24 * time.Hour)
+	// Initialize server
+	server := NewServer()
 
-	// Initialize API handlers
-	apiHandler := api.NewHandler(certManager, sessionManager)
+	// Initialize CLI
+	cli := cli.NewCLI(server, config)
 
-	// Configure TLS
-	tlsConfig := &tls.Config{
-		ClientAuth:       tls.RequireAndVerifyClientCert,
-		ClientCAs:        certManager.GetCertPool(),
-		MinVersion:       tls.VersionTLS12,
-		CurvePreferences: []tls.CurveID{tls.CurveP256, tls.CurveP384, tls.CurveP521},
-		CipherSuites: []uint16{
-			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-		},
-	}
+	// Start HTTP server in a goroutine
+	go func() {
+		addr := fmt.Sprintf(":%d", config.Port)
+		if config.TLSEnabled {
+			log.Printf("Server starting with TLS on %s...", addr)
+			log.Fatal(http.ListenAndServeTLS(addr, config.TLSCert, config.TLSKey, nil))
+		} else {
+			log.Printf("Server starting on %s...", addr)
+			log.Fatal(http.ListenAndServe(addr, nil))
+		}
+	}()
 
-	// Create HTTPS server
-	server := &http.Server{
-		Addr:         ":" + *port,
-		Handler:      apiHandler.Router(),
-		TLSConfig:    tlsConfig,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  120 * time.Second,
-	}
-
-	// Start server
-	certFile := filepath.Join(*certDir, "server-cert.pem")
-	keyFile := filepath.Join(*certDir, "server-key.pem")
-	log.Printf("Starting server on port %s...", *port)
-	log.Fatal(server.ListenAndServeTLS(certFile, keyFile))
+	// Start CLI
+	cli.Run()
 }
